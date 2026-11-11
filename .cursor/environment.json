@@ -1,0 +1,4 @@
+{
+  "name": "Blaze",
+  "install": "bash dev/cursor-agent-install.sh"
+}
