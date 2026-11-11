@@ -1,5 +1,28 @@
+diff --git a/src/bin/orc-stats.rs b/src/bin/orc-stats.rs
+index 369117f..231bfb8 100644
+--- a/src/bin/orc-stats.rs
++++ b/src/bin/orc-stats.rs
+@@ -49,10 +49,15 @@ fn print_column_stats(col_stats: &ColumnStatistics) {
+                     println!("* Sum: {sum}");
+                 }
+             }
+-            orc_rust::statistics::TypeStatistics::String { min, max, sum } => {
++            orc_rust::statistics::TypeStatistics::String {
++                lower_bound,
++                upper_bound,
++                sum,
++                ..
++            } => {
+                 println!("* Data type String");
+-                println!("* Minimum: {min}");
+-                println!("* Maximum: {max}");
++                println!("* Lower bound: {}", lower_bound.as_deref().unwrap_or("<unknown>"));
++                println!("* Upper bound: {}", upper_bound.as_deref().unwrap_or("<unknown>"));
+                 println!("* Sum: {sum}");
+             }
+             orc_rust::statistics::TypeStatistics::Bucket { true_count } => {
 diff --git a/src/row_group_filter.rs b/src/row_group_filter.rs
-index 74a1157..c3d881e 100644
+index 74a1157..58c32aa 100644
 --- a/src/row_group_filter.rs
 +++ b/src/row_group_filter.rs
 @@ -230,8 +230,21 @@ fn evaluate_comparison_with_stats(
@@ -16,8 +39,8 @@ index 74a1157..c3d881e 100644
 +            ..
 +        } => match value {
 +            PredicateValue::Utf8(Some(v)) => evaluate_string_comparison(
-+                lower_bound,
-+                upper_bound,
++                lower_bound.as_deref(),
++                upper_bound.as_deref(),
 +                op,
 +                v,
 +                *is_exact_min,
@@ -31,35 +54,36 @@ index 74a1157..c3d881e 100644
                      // For decimal, we need to compare strings
                      // This is a simplified implementation
 -                    evaluate_string_comparison(min, max, op, v)
-+                    evaluate_string_comparison(min, max, op, v, true, true)
++                    evaluate_string_comparison(Some(min), Some(max), op, v, true, true)
                  }
                  _ => {
                      return Err(UnexpectedSnafu {
-@@ -400,32 +413,30 @@ fn evaluate_float_comparison(min: f64, max: f64, op: ComparisonOp, value: f64) -
+@@ -400,32 +413,37 @@ fn evaluate_float_comparison(min: f64, max: f64, op: ComparisonOp, value: f64) -
      }
  }
  
 -fn evaluate_string_comparison(min: &str, max: &str, op: ComparisonOp, value: &str) -> bool {
 +fn evaluate_string_comparison(
-+    lower_bound: &str,
-+    upper_bound: &str,
++    lower_bound: Option<&str>,
++    upper_bound: Option<&str>,
 +    op: ComparisonOp,
 +    value: &str,
 +    is_exact_min: bool,
 +    is_exact_max: bool,
 +) -> bool {
-+    let min_le_value = lower_bound < value || (lower_bound == value && is_exact_min);
-+    let max_ge_value = upper_bound > value || (upper_bound == value && is_exact_max);
++    let min_le_value = lower_bound.map_or(true, |bound| {
++        bound < value || (bound == value && is_exact_min)
++    });
++    let max_ge_value = upper_bound.map_or(true, |bound| {
++        bound > value || (bound == value && is_exact_max)
++    });
 +
      match op {
 -        ComparisonOp::Equal => {
 -            // col = value: keep if value is within [min, max] lexicographically
 -            min <= value && value <= max
 -        }
-+        // A row group may contain the value only when both bounds include it.
-+        ComparisonOp::Equal => min_le_value && max_ge_value,
-+        // Only exact singleton bounds prove that all values equal `value`.
-         ComparisonOp::NotEqual => {
+-        ComparisonOp::NotEqual => {
 -            // col != value: keep if value is not the only value
 -            !(min == value && max == value)
 -        }
@@ -78,18 +102,26 @@ index 74a1157..c3d881e 100644
 -        ComparisonOp::GreaterThanOrEqual => {
 -            // col >= value: keep if max >= value
 -            max >= value
-+            let is_single_value_column = lower_bound == upper_bound && is_exact_min && is_exact_max;
-+            !(is_single_value_column && lower_bound == value)
-         }
-+        // An inexact lower bound is still sufficient for strict comparison.
-+        ComparisonOp::LessThan => lower_bound < value,
+-        }
++        // Unknown bounds cannot prove that the row group lacks a match.
++        ComparisonOp::Equal => min_le_value && max_ge_value,
++        // Only exact singleton bounds prove that all values equal `value`.
++        ComparisonOp::NotEqual => match (lower_bound, upper_bound) {
++            (Some(lower), Some(upper)) => {
++                let is_single_value_column = lower == upper && is_exact_min && is_exact_max;
++                !(is_single_value_column && lower == value)
++            }
++            _ => true,
++        },
++        // One-sided bounds are sufficient for these predicates.
++        ComparisonOp::LessThan => lower_bound.map_or(true, |bound| bound < value),
 +        ComparisonOp::LessThanOrEqual => min_le_value,
-+        ComparisonOp::GreaterThan => upper_bound > value,
++        ComparisonOp::GreaterThan => upper_bound.map_or(true, |bound| bound > value),
 +        ComparisonOp::GreaterThanOrEqual => max_ge_value,
      }
  }
  
-@@ -1053,4 +1064,103 @@ mod tests {
+@@ -1053,4 +1071,173 @@ mod tests {
          assert_eq!(result.len(), 1);
          assert!(result[0]); // Keep when statistics missing
      }
@@ -118,8 +150,10 @@ index 74a1157..c3d881e 100644
 +                is_exact_max,
 +                ..
 +            } => {
-+                assert_eq!(lower_bound, &"a".repeat(1024));
-+                assert_eq!(upper_bound, &"z".repeat(1024));
++                let expected_lower = "a".repeat(1024);
++                let expected_upper = "z".repeat(1024);
++                assert_eq!(lower_bound.as_deref(), Some(expected_lower.as_str()));
++                assert_eq!(upper_bound.as_deref(), Some(expected_upper.as_str()));
 +                assert!(!is_exact_min);
 +                assert!(!is_exact_max);
 +            }
@@ -140,45 +174,113 @@ index 74a1157..c3d881e 100644
 +        use crate::predicate::ComparisonOp;
 +
 +        assert!(!super::evaluate_string_comparison(
-+            "a",
-+            "c",
++            Some("a"),
++            Some("c"),
 +            ComparisonOp::Equal,
 +            "a",
 +            false,
 +            true,
 +        ));
 +        assert!(!super::evaluate_string_comparison(
-+            "a",
-+            "c",
++            Some("a"),
++            Some("c"),
 +            ComparisonOp::Equal,
 +            "c",
 +            true,
 +            false,
 +        ));
 +        assert!(!super::evaluate_string_comparison(
-+            "a",
-+            "c",
++            Some("a"),
++            Some("c"),
 +            ComparisonOp::LessThanOrEqual,
 +            "a",
 +            false,
 +            true,
 +        ));
 +        assert!(!super::evaluate_string_comparison(
-+            "a",
-+            "c",
++            Some("a"),
++            Some("c"),
 +            ComparisonOp::GreaterThanOrEqual,
 +            "c",
 +            true,
 +            false,
 +        ));
 +        assert!(super::evaluate_string_comparison(
-+            "a",
-+            "c",
++            Some("a"),
++            Some("c"),
 +            ComparisonOp::NotEqual,
 +            "a",
 +            false,
 +            true,
 +        ));
++    }
++
++    #[test]
++    fn test_missing_string_bounds_keep_possible_matches() {
++        use crate::predicate::{ComparisonOp, PredicateValue};
++
++        let missing_upper = crate::statistics::ColumnStatistics::try_from(
++            &proto::ColumnStatistics {
++                number_of_values: Some(1),
++                string_statistics: Some(proto::StringStatistics {
++                    minimum: Some("a".to_string()),
++                    ..Default::default()
++                }),
++                ..Default::default()
++            },
++        )
++        .unwrap();
++        assert!(super::evaluate_comparison_with_stats(
++            &missing_upper,
++            ComparisonOp::Equal,
++            &PredicateValue::Utf8(Some("x".to_string())),
++        )
++        .unwrap());
++        assert!(super::evaluate_comparison_with_stats(
++            &missing_upper,
++            ComparisonOp::GreaterThan,
++            &PredicateValue::Utf8(Some("z".to_string())),
++        )
++        .unwrap());
++
++        let missing_lower = crate::statistics::ColumnStatistics::try_from(
++            &proto::ColumnStatistics {
++                number_of_values: Some(1),
++                string_statistics: Some(proto::StringStatistics {
++                    maximum: Some("z".to_string()),
++                    ..Default::default()
++                }),
++                ..Default::default()
++            },
++        )
++        .unwrap();
++        assert!(super::evaluate_comparison_with_stats(
++            &missing_lower,
++            ComparisonOp::Equal,
++            &PredicateValue::Utf8(Some("x".to_string())),
++        )
++        .unwrap());
++        assert!(super::evaluate_comparison_with_stats(
++            &missing_lower,
++            ComparisonOp::LessThan,
++            &PredicateValue::Utf8(Some("a".to_string())),
++        )
++        .unwrap());
++
++        let missing_both = crate::statistics::ColumnStatistics::try_from(
++            &proto::ColumnStatistics {
++                number_of_values: Some(1),
++                string_statistics: Some(proto::StringStatistics::default()),
++                ..Default::default()
++            },
++        )
++        .unwrap();
++        assert!(super::evaluate_comparison_with_stats(
++            &missing_both,
++            ComparisonOp::Equal,
++            &PredicateValue::Utf8(Some("x".to_string())),
++        )
++        .unwrap());
 +    }
 +
 +    #[test]
@@ -194,7 +296,7 @@ index 74a1157..c3d881e 100644
 +    }
  }
 diff --git a/src/statistics.rs b/src/statistics.rs
-index 6891e91..272dc25 100644
+index 6891e91..0e8ab7f 100644
 --- a/src/statistics.rs
 +++ b/src/statistics.rs
 @@ -58,10 +58,14 @@ pub enum TypeStatistics {
@@ -203,8 +305,8 @@ index 6891e91..272dc25 100644
      String {
 -        min: String,
 -        max: String,
-+        lower_bound: String,
-+        upper_bound: String,
++        lower_bound: Option<String>,
++        upper_bound: Option<String>,
          /// Total length of all strings
          sum: i64,
 +        /// Whether `lower_bound` is the exact minimum value.
@@ -225,25 +327,23 @@ index 6891e91..272dc25 100644
              Some(TypeStatistics::Integer {
                  min: stats.minimum(),
                  max: stats.maximum(),
-@@ -114,10 +120,22 @@ impl TryFrom<&proto::ColumnStatistics> for ColumnStatistics {
+@@ -114,10 +120,20 @@ impl TryFrom<&proto::ColumnStatistics> for ColumnStatistics {
                  sum: stats.sum,
              })
          } else if let Some(stats) = &value.string_statistics {
-+            let (lower_bound, is_exact_min) = stats
-+                .minimum
-+                .as_deref()
-+                .map(|s| (s, true))
-+                .unwrap_or_else(|| (stats.lower_bound(), false));
-+            let (upper_bound, is_exact_max) = stats
-+                .maximum
-+                .as_deref()
-+                .map(|s| (s, true))
-+                .unwrap_or_else(|| (stats.upper_bound(), false));
++            let (lower_bound, is_exact_min) = match &stats.minimum {
++                Some(minimum) => (Some(minimum.clone()), true),
++                None => (stats.lower_bound.clone(), false),
++            };
++            let (upper_bound, is_exact_max) = match &stats.maximum {
++                Some(maximum) => (Some(maximum.clone()), true),
++                None => (stats.upper_bound.clone(), false),
++            };
              Some(TypeStatistics::String {
 -                min: stats.minimum().to_owned(),
 -                max: stats.maximum().to_owned(),
-+                lower_bound: lower_bound.to_owned(),
-+                upper_bound: upper_bound.to_owned(),
++                lower_bound,
++                upper_bound,
                  sum: stats.sum(),
 +                is_exact_min,
 +                is_exact_max,

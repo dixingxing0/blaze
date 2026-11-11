@@ -66,5 +66,13 @@ jobs:
       - name: Setup vendors
         run: dev/vendors/setup-vendors.sh
 
+      - name: Test ORC string statistics pruning
+        working-directory: dev/vendors/packages/orc-rust
+        run: cargo test --locked --lib string_
+
+      - name: Check ORC stats CLI
+        working-directory: dev/vendors/packages/orc-rust
+        run: cargo check --locked --features cli --bin orc-stats
+
       - name: Build Auron
         run: ./auron-build.sh --pre --sparkver 3.5 --scalaver 2.12 --skiptests true
