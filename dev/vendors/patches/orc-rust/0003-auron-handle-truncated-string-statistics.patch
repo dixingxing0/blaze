@@ -1,0 +1,252 @@
+diff --git a/src/row_group_filter.rs b/src/row_group_filter.rs
+index 74a1157..c3d881e 100644
+--- a/src/row_group_filter.rs
++++ b/src/row_group_filter.rs
+@@ -230,8 +230,21 @@ fn evaluate_comparison_with_stats(
+         }
+ 
+         // String comparisons
+-        TypeStatistics::String { min, max, .. } => match value {
+-            PredicateValue::Utf8(Some(v)) => evaluate_string_comparison(min, max, op, v),
++        TypeStatistics::String {
++            lower_bound,
++            upper_bound,
++            is_exact_min,
++            is_exact_max,
++            ..
++        } => match value {
++            PredicateValue::Utf8(Some(v)) => evaluate_string_comparison(
++                lower_bound,
++                upper_bound,
++                op,
++                v,
++                *is_exact_min,
++                *is_exact_max,
++            ),
+             _ => {
+                 return Err(UnexpectedSnafu {
+                     msg: "Type mismatch: expected string value".to_string(),
+@@ -276,7 +289,7 @@ fn evaluate_comparison_with_stats(
+                 PredicateValue::Utf8(Some(v)) => {
+                     // For decimal, we need to compare strings
+                     // This is a simplified implementation
+-                    evaluate_string_comparison(min, max, op, v)
++                    evaluate_string_comparison(min, max, op, v, true, true)
+                 }
+                 _ => {
+                     return Err(UnexpectedSnafu {
+@@ -400,32 +413,30 @@ fn evaluate_float_comparison(min: f64, max: f64, op: ComparisonOp, value: f64) -
+     }
+ }
+ 
+-fn evaluate_string_comparison(min: &str, max: &str, op: ComparisonOp, value: &str) -> bool {
++fn evaluate_string_comparison(
++    lower_bound: &str,
++    upper_bound: &str,
++    op: ComparisonOp,
++    value: &str,
++    is_exact_min: bool,
++    is_exact_max: bool,
++) -> bool {
++    let min_le_value = lower_bound < value || (lower_bound == value && is_exact_min);
++    let max_ge_value = upper_bound > value || (upper_bound == value && is_exact_max);
++
+     match op {
+-        ComparisonOp::Equal => {
+-            // col = value: keep if value is within [min, max] lexicographically
+-            min <= value && value <= max
+-        }
++        // A row group may contain the value only when both bounds include it.
++        ComparisonOp::Equal => min_le_value && max_ge_value,
++        // Only exact singleton bounds prove that all values equal `value`.
+         ComparisonOp::NotEqual => {
+-            // col != value: keep if value is not the only value
+-            !(min == value && max == value)
+-        }
+-        ComparisonOp::LessThan => {
+-            // col < value: keep if min < value
+-            min < value
+-        }
+-        ComparisonOp::LessThanOrEqual => {
+-            // col <= value: keep if min <= value
+-            min <= value
+-        }
+-        ComparisonOp::GreaterThan => {
+-            // col > value: keep if max > value
+-            max > value
+-        }
+-        ComparisonOp::GreaterThanOrEqual => {
+-            // col >= value: keep if max >= value
+-            max >= value
++            let is_single_value_column = lower_bound == upper_bound && is_exact_min && is_exact_max;
++            !(is_single_value_column && lower_bound == value)
+         }
++        // An inexact lower bound is still sufficient for strict comparison.
++        ComparisonOp::LessThan => lower_bound < value,
++        ComparisonOp::LessThanOrEqual => min_le_value,
++        ComparisonOp::GreaterThan => upper_bound > value,
++        ComparisonOp::GreaterThanOrEqual => max_ge_value,
+     }
+ }
+ 
+@@ -1053,4 +1064,103 @@ mod tests {
+         assert_eq!(result.len(), 1);
+         assert!(result[0]); // Keep when statistics missing
+     }
++
++    #[test]
++    fn test_truncated_string_statistics_keep_possible_matches() {
++        use crate::predicate::{ComparisonOp, PredicateValue};
++        use crate::statistics::TypeStatistics;
++
++        let stats = crate::statistics::ColumnStatistics::try_from(&proto::ColumnStatistics {
++            number_of_values: Some(1),
++            string_statistics: Some(proto::StringStatistics {
++                lower_bound: Some("a".repeat(1024)),
++                upper_bound: Some("z".repeat(1024)),
++                ..Default::default()
++            }),
++            ..Default::default()
++        })
++        .unwrap();
++
++        match stats.type_statistics().unwrap() {
++            TypeStatistics::String {
++                lower_bound,
++                upper_bound,
++                is_exact_min,
++                is_exact_max,
++                ..
++            } => {
++                assert_eq!(lower_bound, &"a".repeat(1024));
++                assert_eq!(upper_bound, &"z".repeat(1024));
++                assert!(!is_exact_min);
++                assert!(!is_exact_max);
++            }
++            other => panic!("expected string statistics, got {other:?}"),
++        }
++
++        let matching_value = PredicateValue::Utf8(Some("m".repeat(1024)));
++        assert!(super::evaluate_comparison_with_stats(
++            &stats,
++            ComparisonOp::Equal,
++            &matching_value,
++        )
++        .unwrap());
++    }
++
++    #[test]
++    fn test_string_comparison_respects_bound_exactness() {
++        use crate::predicate::ComparisonOp;
++
++        assert!(!super::evaluate_string_comparison(
++            "a",
++            "c",
++            ComparisonOp::Equal,
++            "a",
++            false,
++            true,
++        ));
++        assert!(!super::evaluate_string_comparison(
++            "a",
++            "c",
++            ComparisonOp::Equal,
++            "c",
++            true,
++            false,
++        ));
++        assert!(!super::evaluate_string_comparison(
++            "a",
++            "c",
++            ComparisonOp::LessThanOrEqual,
++            "a",
++            false,
++            true,
++        ));
++        assert!(!super::evaluate_string_comparison(
++            "a",
++            "c",
++            ComparisonOp::GreaterThanOrEqual,
++            "c",
++            true,
++            false,
++        ));
++        assert!(super::evaluate_string_comparison(
++            "a",
++            "c",
++            ComparisonOp::NotEqual,
++            "a",
++            false,
++            true,
++        ));
++    }
++
++    #[test]
++    fn test_empty_string_statistics_have_no_bounds() {
++        let stats = crate::statistics::ColumnStatistics::try_from(&proto::ColumnStatistics {
++            number_of_values: Some(0),
++            string_statistics: Some(proto::StringStatistics::default()),
++            ..Default::default()
++        })
++        .unwrap();
++
++        assert!(stats.type_statistics().is_none());
++    }
+ }
+diff --git a/src/statistics.rs b/src/statistics.rs
+index 6891e91..272dc25 100644
+--- a/src/statistics.rs
++++ b/src/statistics.rs
+@@ -58,10 +58,14 @@ pub enum TypeStatistics {
+         sum: Option<f64>,
+     },
+     String {
+-        min: String,
+-        max: String,
++        lower_bound: String,
++        upper_bound: String,
+         /// Total length of all strings
+         sum: i64,
++        /// Whether `lower_bound` is the exact minimum value.
++        is_exact_min: bool,
++        /// Whether `upper_bound` is the exact maximum value.
++        is_exact_max: bool,
+     },
+     /// For Boolean
+     Bucket { true_count: u64 },
+@@ -101,7 +105,9 @@ impl TryFrom<&proto::ColumnStatistics> for ColumnStatistics {
+     type Error = error::OrcError;
+ 
+     fn try_from(value: &proto::ColumnStatistics) -> Result<Self, Self::Error> {
+-        let type_statistics = if let Some(stats) = &value.int_statistics {
++        let type_statistics = if value.number_of_values() == 0 {
++            None
++        } else if let Some(stats) = &value.int_statistics {
+             Some(TypeStatistics::Integer {
+                 min: stats.minimum(),
+                 max: stats.maximum(),
+@@ -114,10 +120,22 @@ impl TryFrom<&proto::ColumnStatistics> for ColumnStatistics {
+                 sum: stats.sum,
+             })
+         } else if let Some(stats) = &value.string_statistics {
++            let (lower_bound, is_exact_min) = stats
++                .minimum
++                .as_deref()
++                .map(|s| (s, true))
++                .unwrap_or_else(|| (stats.lower_bound(), false));
++            let (upper_bound, is_exact_max) = stats
++                .maximum
++                .as_deref()
++                .map(|s| (s, true))
++                .unwrap_or_else(|| (stats.upper_bound(), false));
+             Some(TypeStatistics::String {
+-                min: stats.minimum().to_owned(),
+-                max: stats.maximum().to_owned(),
++                lower_bound: lower_bound.to_owned(),
++                upper_bound: upper_bound.to_owned(),
+                 sum: stats.sum(),
++                is_exact_min,
++                is_exact_max,
+             })
+         } else if let Some(stats) = &value.bucket_statistics {
+             // TODO: false count?

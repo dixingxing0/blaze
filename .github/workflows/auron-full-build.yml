@@ -1,0 +1,70 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Auron Full Build
+
+on:
+  push:
+    branches:
+      - 'ci/full-build/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-build:
+    name: Spark 3.5 / Scala 2.12 compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Checkout Auron
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Java and Maven cache
+        uses: actions/setup-java@v5
+        with:
+          distribution: adopt-hotspot
+          java-version: '17'
+          cache: maven
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '21.7'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          rustflags: --allow warnings -C target-feature=+aes
+          components:
+            cargo
+
+      - name: Setup vendors
+        run: dev/vendors/setup-vendors.sh
+
+      - name: Build Auron
+        run: ./auron-build.sh --pre --sparkver 3.5 --scalaver 2.12 --skiptests true
