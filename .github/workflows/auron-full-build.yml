@@ -66,6 +66,10 @@ jobs:
       - name: Setup vendors
         run: dev/vendors/setup-vendors.sh
 
+      - name: Generate ORC Cargo.lock
+        working-directory: dev/vendors/packages/orc-rust
+        run: cargo generate-lockfile
+
       - name: Test ORC string statistics pruning
         working-directory: dev/vendors/packages/orc-rust
         run: cargo test --locked --lib string_
